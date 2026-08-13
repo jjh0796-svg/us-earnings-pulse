@@ -159,7 +159,7 @@ def summarize(text: str) -> dict | None:
         "contents": [{"parts": [{"text": _PROMPT.format(text=text)}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
     }
-    for model in ("gemini-2.5-flash", "gemini-2.0-flash"):
+    for model in ("gemini-3.6-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"):
         try:
             resp = requests.post(
                 "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -225,6 +225,8 @@ def send(message: str, dry_run: bool) -> None:
 
 
 def to_kst(updated: str) -> str:
+    if len(updated) <= 10:  # 날짜만 있는 경우(강제 처리 데모)
+        return updated
     try:
         stamp = dt.datetime.fromisoformat(updated.replace("Z", "+00:00"))
         return stamp.astimezone(KST).strftime("%H:%M KST")
