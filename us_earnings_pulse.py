@@ -137,18 +137,53 @@ def press_release_text(cik: int, acc: str) -> tuple[str | None, str | None]:
 
 
 _PROMPT = """미국 기업의 분기 실적 보도자료다. 투자자용 속보로 JSON으로만 답하라.
-모든 값은 한국어, 보도자료에 명시된 수치만 사용(유추 금지).
+모든 값은 한국어, 보도자료에 명시된 수치만 사용(유추·추정 금지, 없으면 null).
 
 JSON 스키마:
 {{
- "headline": "실적 핵심 한 문장 (매출·YoY 포함)",
- "lines": ["📈 매출 $X (YoY ±x%)", "💰 EPS $X (비GAAP이면 표기)", "🧭 다음 분기 가이던스: 매출 $X~Y, 마진 x% (제시된 것만)", "❗ 특이사항 한 줄 (있으면)"]
+ "period_end": "이번 실적 분기의 마감일 YYYY-MM-DD (보도자료에 명시된 날짜)",
+ "fiscal_label": "보도자료가 부르는 분기명 축약 (예: FY2026 4Q). 없으면 null",
+ "revenue": "매출, 예: $2.05B",
+ "revenue_yoy": "전년 동기 대비, 예: +34% (없으면 null)",
+ "eps": "대표 EPS, 예: $1.74",
+ "eps_basis": "위 EPS의 기준 — 비GAAP 또는 GAAP",
+ "eps_gaap": "비GAAP을 대표로 썼을 때 GAAP EPS, 예: $1.19 (없으면 null)",
+ "guide_revenue": "다음 분기 매출 가이던스, 예: $2.2~2.4B (없으면 null)",
+ "guide_margin": "다음 분기 마진 가이던스, 기준 포함, 예: 비GAAP 총마진 39.5~41.5% (없으면 null)",
+ "note": "그 외 투자자가 알아야 할 특이사항 한 줄 (없으면 null)"
 }}
-lines는 확인된 항목만 2~4개.
 
 보도자료:
 {text}
 """
+
+_MONTH_NAMES = {
+    1: "january", 2: "february", 3: "march", 4: "april", 5: "may", 6: "june",
+    7: "july", 8: "august", 9: "september", 10: "october", 11: "november", 12: "december",
+}
+
+
+def _verify_period_end(period_end, transcript: str) -> str | None:
+    """보도자료 본문에 실제로 등장하는 날짜만 인정 (환각 차단)."""
+    pe = str(period_end or "")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", pe):
+        return None
+    y, m, d = (int(x) for x in pe.split("-"))
+    low = transcript.lower()
+    full, abbr = _MONTH_NAMES[m], _MONTH_NAMES[m][:3]
+    for pat in (f"{full} {d}", f"{abbr}. {d}", f"{abbr} {d}"):
+        if pat in low:
+            return pe
+    return None
+
+
+def _calendar_label(period_end: str | None) -> str | None:
+    """마감일 → '달력 2Q26 (6/28 마감)'. 월초 마감 경계는 −45일 중간점으로 보정."""
+    if not period_end:
+        return None
+    y, m, d = (int(x) for x in period_end.split("-"))
+    mid = dt.date(y, m, d) - dt.timedelta(days=45)
+    return f"달력 {(mid.month - 1) // 3 + 1}Q{mid.year % 100} ({m}/{d} 마감)"
 
 
 def summarize(text: str) -> dict | None:
@@ -174,29 +209,52 @@ def summarize(text: str) -> dict | None:
         except Exception as exc:
             LOGGER.info("Gemini %s 실패: %s", model, exc)
             continue
-        if isinstance(data, dict) and isinstance(data.get("headline"), str):
-            lines = data.get("lines")
-            data["lines"] = (
-                [str(x).strip() for x in lines if str(x).strip()][:4]
-                if isinstance(lines, list)
-                else []
-            )
+        if isinstance(data, dict) and str(data.get("revenue") or "").strip():
+            for field in (
+                "period_end", "fiscal_label", "revenue", "revenue_yoy", "eps",
+                "eps_basis", "eps_gaap", "guide_revenue", "guide_margin", "note",
+            ):
+                value = data.get(field)
+                data[field] = str(value).strip() if value not in (None, "") else None
+            data["period_end"] = _verify_period_end(data["period_end"], text)
             return data
     return None
 
 
 def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | None, when_kst: str) -> str:
-    head = f"⚡ <b>실적 속보 — {html.escape(name)}({ticker})</b>\n8-K 접수 {when_kst}\n"
-    parts = [head]
+    e = html.escape
+    parts = [f"⚡ <b>실적 속보 — {e(name)}({ticker})</b>\n"]
     if brief:
-        parts.append(f"\n{html.escape(brief['headline'])}\n")
-        if brief["lines"]:
-            parts.append("\n".join(html.escape(line) for line in brief["lines"]) + "\n")
+        # 분기 표기: 회계 분기명 + 달력 분기 병기 (혼동 방지)
+        cal = _calendar_label(brief.get("period_end"))
+        quarter_bits = [b for b in (brief.get("fiscal_label"), cal) if b]
+        quarter_line = " = ".join(quarter_bits)
+        parts.append(f"🗓 {e(quarter_line)} · 접수 {e(when_kst)}\n\n" if quarter_line else f"🗓 접수 {e(when_kst)}\n\n")
+        rev = f"📈 매출 {e(brief['revenue'])}"
+        if brief.get("revenue_yoy"):
+            rev += f" (YoY {e(brief['revenue_yoy'])})"
+        parts.append(rev + "\n")
+        if brief.get("eps"):
+            eps = f"💰 EPS {e(brief['eps'])}"
+            if brief.get("eps_basis"):
+                eps += f" {e(brief['eps_basis'])}"
+            if brief.get("eps_gaap"):
+                eps += f" (GAAP {e(brief['eps_gaap'])})"
+            parts.append(eps + "\n")
+        guides = [g for g in (brief.get("guide_revenue"), brief.get("guide_margin")) if g]
+        if guides:
+            parts.append("\n🧭 <b>다음 분기 가이던스</b>\n")
+            labels = ["매출 ", ""] if brief.get("guide_revenue") else [""]
+            for label, g in zip(labels, guides):
+                parts.append(f"• {label}{e(g)}\n")
+        if brief.get("note"):
+            parts.append(f"\n❗ {e(brief['note'])}\n")
     else:
-        parts.append("\n보도자료 요약 실패 — 원문을 확인하세요.\n")
+        parts.append(f"🗓 접수 {e(when_kst)}\n\n보도자료 요약 실패 — 원문을 확인하세요.\n")
+    parts.append("\n")
     if doc_url:
-        parts.append(f'\n🔗 <a href="{html.escape(doc_url)}">보도자료(SEC)</a>')
-    parts.append("\n(상세 분석·차트는 다음날 아침 실적 요약에서)")
+        parts.append(f'🔗 <a href="{e(doc_url)}">보도자료(SEC)</a> · ')
+    parts.append("상세 분석·차트는 내일 아침 자동 발송")
     return "".join(parts)
 
 
