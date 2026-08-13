@@ -1,0 +1,22 @@
+name: Keepalive
+
+on:
+  schedule:
+    - cron: "0 1 1 * *"  # 매월 1일
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch keepalive
+        run: |
+          sed -i "s/^last:.*/last: $(date -u +%F)/" keepalive.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add keepalive.md
+          git commit -m "chore: keepalive" || exit 0
+          git push

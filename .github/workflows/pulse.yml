@@ -1,0 +1,76 @@
+name: US Earnings Pulse
+
+run-name: US Earnings Pulse (${{ inputs.trigger_source || github.event_name }})
+
+on:
+  schedule:
+    # 미국 장마감 후 발표 창: 16:00~18:59 ET ≈ UTC 20~23시 (KST 05~08시)
+    - cron: "*/15 20-23 * * 1-5"
+    # 미국 장전 발표 창: 06:00~08:59 ET ≈ UTC 10~13시 (KST 19~22시)
+    - cron: "*/15 10-13 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without sending Telegram messages"
+        required: false
+        type: boolean
+        default: false
+      force_acc:
+        description: "접수번호 강제 처리(데모, 예: 0000723125-26-000013)"
+        required: false
+        type: string
+        default: ""
+      trigger_source:
+        description: "Short label for the caller"
+        required: false
+        type: string
+        default: "manual"
+
+concurrency:
+  group: us-earnings-pulse
+  cancel-in-progress: false
+
+jobs:
+  pulse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: .pulse
+          key: pulse-state-${{ github.run_id }}
+          restore-keys: |
+            pulse-state-
+      - name: Prepare state directory
+        run: mkdir -p .pulse
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run pulse
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PULSE_STATE_FILE: .pulse/state.json
+        run: |
+          ARGS=""
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then ARGS="$ARGS --dry-run"; fi
+          if [[ -n "${{ inputs.force_acc }}" ]]; then ARGS="$ARGS --force-acc ${{ inputs.force_acc }}"; fi
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then ARGS="$ARGS --loop-minutes 14"; fi
+          python us_earnings_pulse.py $ARGS
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .pulse
+          key: pulse-state-${{ github.run_id }}
