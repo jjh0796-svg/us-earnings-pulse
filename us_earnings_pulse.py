@@ -83,9 +83,11 @@ def cik_for_watch(state: dict, watch: dict[str, str]) -> dict[int, str]:
     return result
 
 
+# SEC가 2026-08경 피드 링크에 접수 폴더 단계를 추가(.../data/CIK/폴더/ACC-index.htm)
+# — 폴더 유무 모두 매칭 (구형식도 허용). 형식 재변경 시 0건 경고가 신호.
 ENTRY_RE = re.compile(
     r"<entry>.*?<title>(.*?)</title>.*?href=\"([^\"]*/Archives/edgar/data/(\d+)/"
-    r"([0-9-]+)-index\.htm)\".*?<updated>([^<]+)</updated>.*?</entry>",
+    r"(?:\d+/)?([0-9-]+)-index\.htm)\".*?<updated>([^<]+)</updated>.*?</entry>",
     re.S,
 )
 
