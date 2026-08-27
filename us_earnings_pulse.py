@@ -34,7 +34,7 @@ FEED_URL = (
 )
 WATCHLIST_FILE = Path(__file__).resolve().parent / "watchlist.json"
 KST = dt.timezone(dt.timedelta(hours=9))
-POLL_SECONDS = 75
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "75"))  # 서버 상주 시 40초 등으로 단축
 MAX_TEXT_CHARS = 40_000
 
 
