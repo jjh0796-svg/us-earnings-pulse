@@ -296,17 +296,24 @@ def to_kst(updated: str) -> str:
 
 def process_accession(
     cik: int, acc: str, ticker: str, name: str, updated: str, dry_run: bool
-) -> bool:
+) -> str:
+    """반환: 'sent' | 'skip'(비실적 확정) | 'retry'(items 색인 미완 — 재확인 필요).
+
+    발표 직후엔 submissions 색인의 items가 잠시 비어 오는데(DELL 9/2 새벽,
+    items=None), 이때 무시 확정하면 실적 8-K를 영영 놓친다."""
     meta = filing_meta(cik, acc)
-    if meta is None or "2.02" not in meta["items"]:
-        LOGGER.info("%s %s: 실적(2.02) 아님 — 무시 (items=%s)", ticker, acc, meta and meta["items"])
-        return False
+    if meta is None or not meta["items"]:
+        LOGGER.info("%s %s: items 색인 대기 — 다음 폴에서 재확인", ticker, acc)
+        return "retry"
+    if "2.02" not in meta["items"]:
+        LOGGER.info("%s %s: 실적(2.02) 아님 — 무시 (items=%s)", ticker, acc, meta["items"])
+        return "skip"
     text, doc_url = press_release_text(cik, acc)
     brief = summarize(text) if text else None
     message = build_message(name, ticker, brief, doc_url, to_kst(updated))
     send(message, dry_run)
     LOGGER.info("속보 %s: %s %s", "출력" if dry_run else "발송", ticker, acc)
-    return True
+    return "sent"
 
 
 def poll_once(state: dict, watch: dict[str, str], cik_map: dict[int, str], dry_run: bool) -> int:
@@ -320,16 +327,21 @@ def poll_once(state: dict, watch: dict[str, str], cik_map: dict[int, str], dry_r
     for entry in entries:
         if entry["acc"] in seen:
             continue
-        seen.add(entry["acc"])
         if entry["cik"] not in cik_map:
+            seen.add(entry["acc"])
             continue
         if first_run:
+            seen.add(entry["acc"])
             LOGGER.info("초기 실행 — %s 기준선만 기록", entry["acc"])
             continue
         ticker = cik_map[entry["cik"]]
-        if process_accession(
+        result = process_accession(
             entry["cik"], entry["acc"], ticker, watch.get(ticker, ticker), entry["updated"], dry_run
-        ):
+        )
+        if result == "retry":
+            continue  # seen 미기록 → 색인 채워지면 다음 폴에서 처리
+        seen.add(entry["acc"])
+        if result == "sent":
             sent += 1
     state["seen"] = sorted(seen)
     return sent
