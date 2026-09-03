@@ -150,6 +150,7 @@ JSON 스키마:
  "eps": "대표 EPS, 예: $1.74",
  "eps_basis": "위 EPS의 기준 — 비GAAP 또는 GAAP",
  "eps_gaap": "비GAAP을 대표로 썼을 때 GAAP EPS, 예: $1.19 (없으면 null)",
+ "gross_margin": "이번 분기 매출총이익률, 기준 포함, 예: 비GAAP 78.4% (없으면 null)",
  "guide_revenue": "다음 분기 매출 가이던스, 예: $2.2~2.4B (없으면 null)",
  "guide_margin": "다음 분기 마진 가이던스, 기준 포함, 예: 비GAAP 총마진 39.5~41.5% (없으면 null)",
  "note": "그 외 투자자가 알아야 할 특이사항 한 줄 (없으면 null)"
@@ -223,7 +224,63 @@ def summarize(text: str) -> dict | None:
     return None
 
 
-def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | None, when_kst: str) -> str:
+
+def _num_from_money(text) -> float | None:
+    """'$3.32' / '$29.6B' 류에서 숫자만 (B/M 배율 포함)."""
+    m = re.search(r"\$?([0-9][0-9,.]*)\s*([BbMm]?)", str(text or ""))
+    if not m:
+        return None
+    v = float(m.group(1).replace(",", ""))
+    unit = m.group(2).lower()
+    if unit == "b":
+        v *= 1e9
+    elif unit == "m":
+        v *= 1e6
+    return v
+
+
+def market_context(ticker: str, brief: dict | None) -> dict:
+    """야후에서 컨센서스·주가 반응을 보강 (실패는 조용히 생략).
+
+    주의: 발표 직후 야후 0q 예상치가 다음 분기로 롤오버됐을 수 있어,
+    실제치와 ±60% 넘게 어긋나면 다른 분기로 보고 비교를 버린다."""
+    out: dict = {}
+    try:
+        import yfinance as yf
+
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+        reg = info.get("regularMarketChangePercent")
+        post = info.get("postMarketChangePercent")
+        pre = info.get("preMarketChangePercent")
+        if reg is not None:
+            out["reg_pct"] = float(reg)
+        if post is not None:
+            out["after_pct"], out["after_label"] = float(post), "시간외"
+        elif pre is not None:
+            out["after_pct"], out["after_label"] = float(pre), "프리장"
+        actual_eps = _num_from_money((brief or {}).get("eps"))
+        try:
+            est = float(t.earnings_estimate.loc["0q"]["avg"])
+            if actual_eps and est and abs(actual_eps / est - 1) <= 0.6:
+                out["eps_est"] = est
+                out["eps_surprise"] = (actual_eps / est - 1) * 100
+        except Exception:
+            pass
+        actual_rev = _num_from_money((brief or {}).get("revenue"))
+        try:
+            rev_est = float(t.revenue_estimate.loc["0q"]["avg"])
+            if actual_rev and rev_est and abs(actual_rev / rev_est - 1) <= 0.3:
+                out["rev_est"] = rev_est
+                out["rev_surprise"] = (actual_rev / rev_est - 1) * 100
+        except Exception:
+            pass
+    except Exception as exc:
+        LOGGER.info("시장 컨텍스트 실패(%s): %s", ticker, exc)
+    return out
+
+
+def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | None, when_kst: str, ctx: dict | None = None) -> str:
     e = html.escape
     parts = [f"⚡ <b>실적 속보 — {e(name)}({ticker})</b>\n"]
     if brief:
@@ -235,6 +292,8 @@ def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | Non
         rev = f"📈 매출 {e(brief['revenue'])}"
         if brief.get("revenue_yoy"):
             rev += f" (YoY {e(brief['revenue_yoy'])})"
+        if ctx and ctx.get("rev_surprise") is not None:
+            rev += f" · 예상比 {ctx['rev_surprise']:+.1f}%"
         parts.append(rev + "\n")
         if brief.get("eps"):
             eps = f"💰 EPS {e(brief['eps'])}"
@@ -242,7 +301,18 @@ def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | Non
                 eps += f" {e(brief['eps_basis'])}"
             if brief.get("eps_gaap"):
                 eps += f" (GAAP {e(brief['eps_gaap'])})"
+            if ctx and ctx.get("eps_est") is not None:
+                eps += f" vs 예상 ${ctx['eps_est']:.2f} ({ctx['eps_surprise']:+.1f}%)"
             parts.append(eps + "\n")
+        if brief.get("gross_margin"):
+            parts.append(f"📐 매출총이익률 {e(brief['gross_margin'])}\n")
+        if ctx and (ctx.get("reg_pct") is not None or ctx.get("after_pct") is not None):
+            bits = []
+            if ctx.get("reg_pct") is not None:
+                bits.append(f"정규장 {ctx['reg_pct']:+.1f}%")
+            if ctx.get("after_pct") is not None:
+                bits.append(f"{ctx.get('after_label', '시간외')} {ctx['after_pct']:+.1f}%")
+            parts.append("📊 주가: " + " · ".join(bits) + "\n")
         guides = [g for g in (brief.get("guide_revenue"), brief.get("guide_margin")) if g]
         if guides:
             parts.append("\n🧭 <b>다음 분기 가이던스</b>\n")
@@ -310,7 +380,8 @@ def process_accession(
         return "skip"
     text, doc_url = press_release_text(cik, acc)
     brief = summarize(text) if text else None
-    message = build_message(name, ticker, brief, doc_url, to_kst(updated))
+    ctx = market_context(ticker, brief)
+    message = build_message(name, ticker, brief, doc_url, to_kst(updated), ctx)
     send(message, dry_run)
     LOGGER.info("속보 %s: %s %s", "출력" if dry_run else "발송", ticker, acc)
     return "sent"
