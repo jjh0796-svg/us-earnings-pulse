@@ -260,19 +260,15 @@ def market_context(ticker: str, brief: dict | None) -> dict:
         elif pre is not None:
             out["after_pct"], out["after_label"] = float(pre), "프리장"
         actual_eps = _num_from_money((brief or {}).get("eps"))
+        # 예상比는 0q 예상치(발표 후 다음 분기로 롤오버되면 오염) 대신
+        # 발표 이력(earnings_history)의 확정 행을 쓴다 — AVGO 9/3 -14% 오염 사고.
         try:
-            est = float(t.earnings_estimate.loc["0q"]["avg"])
-            if actual_eps and est and abs(actual_eps / est - 1) <= 0.6:
+            hist = t.get_earnings_history()
+            last = hist.iloc[-1]
+            est, actual = float(last["epsEstimate"]), float(last["epsActual"])
+            if actual_eps and abs(actual / actual_eps - 1) <= 0.03:
                 out["eps_est"] = est
-                out["eps_surprise"] = (actual_eps / est - 1) * 100
-        except Exception:
-            pass
-        actual_rev = _num_from_money((brief or {}).get("revenue"))
-        try:
-            rev_est = float(t.revenue_estimate.loc["0q"]["avg"])
-            if actual_rev and rev_est and abs(actual_rev / rev_est - 1) <= 0.3:
-                out["rev_est"] = rev_est
-                out["rev_surprise"] = (actual_rev / rev_est - 1) * 100
+                out["eps_surprise"] = float(last["surprisePercent"]) * 100
         except Exception:
             pass
     except Exception as exc:
