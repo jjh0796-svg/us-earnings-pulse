@@ -360,6 +360,115 @@ def to_kst(updated: str) -> str:
         return updated
 
 
+# ── 실적 외 중요 8-K (2026-09-18) ────────────────────────────────────────
+# 대형 계약·손상·구조조정·가이던스 사전공시는 뉴스보다 8-K가 먼저다.
+# ALWAYS 항목은 무조건 발송, JUDGED 항목(7.01/8.01은 IR 자료·배당 선언 등 잡음이
+# 많음)은 Gemini가 중요하다고 본 경우만 — 요약 실패 시에는 놓치지 않게 발송한다.
+ITEM_LABELS = {
+    "1.01": "중요 계약 체결", "1.02": "중요 계약 해지", "1.03": "파산·법정관리",
+    "2.01": "자산 인수·처분 완료", "2.03": "대규모 채무 발생", "2.05": "구조조정·사업 철수",
+    "2.06": "자산 손상", "3.02": "미등록 증권 발행", "4.02": "과거 재무제표 신뢰 불가",
+    "5.02": "임원 변동", "7.01": "공정공시(Reg FD)", "8.01": "기타 중요 사건",
+}
+ALWAYS_ITEMS = {"1.01", "1.02", "1.03", "2.01", "2.05", "2.06", "4.02"}
+JUDGED_ITEMS = {"2.03", "3.02", "5.02", "7.01", "8.01"}
+
+_EVENT_PROMPT = """미국 상장사의 8-K 공시다(분기 실적 발표가 아님). 공시 항목: {labels}
+투자자용 속보를 JSON으로만 답하라. 모든 값은 한국어, 문서에 명시된 내용만(추정 금지).
+{{
+ "headline": "무슨 일인지 한 문장 — 상대방·금액·시점이 있으면 포함",
+ "points": ["핵심 사실, 수치 포함", "최대 3개"],
+ "material": true 또는 false,
+ "why": "material 판단 근거 한 구"
+}}
+material 기준: 실적·주가에 의미 있는 사건이면 true. 정기 배당 선언, 컨퍼런스·IR 행사 참가 안내,
+주주총회 표결 결과, 일상적인 임원 보상 조정, 단순 발표자료 첨부는 false.
+
+문서:
+{text}
+"""
+
+
+def filing_text(cik: int, acc: str) -> tuple[str | None, str | None]:
+    """(본문, URL) — 보도자료(EX-99) 우선, 없으면 가장 큰 본문 문서."""
+    text, url = press_release_text(cik, acc)
+    if text:
+        return text, url
+    acc_nodash = acc.replace("-", "")
+    base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}"
+    try:
+        items = _get(f"{base}/index.json").json()["directory"]["item"]
+    except Exception as exc:
+        LOGGER.warning("index.json 실패(%s): %s", acc, exc)
+        return None, None
+    docs = [
+        (int(f.get("size") or 0), f["name"]) for f in items
+        if f["name"].endswith((".htm", ".html")) and "index" not in f["name"].lower()
+        and not re.match(r"R\d+\.htm", f["name"])
+    ]
+    for _size, name in sorted(docs, reverse=True)[:2]:
+        raw = _get(f"{base}/{name}").text
+        body = re.sub(r"<script.*?</script>|<style.*?</style>", " ", raw, flags=re.S)
+        body = re.sub(r"\s+", " ", re.sub(r"&nbsp;?", " ", re.sub(r"<[^>]+>", " ", body))).strip()
+        if len(body) > 500:
+            return body[:MAX_TEXT_CHARS], f"{base}/{name}"
+    return None, None
+
+
+def summarize_event(text: str, labels: str) -> dict | None:
+    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not key:
+        return None
+    body = {
+        "contents": [{"parts": [{"text": _EVENT_PROMPT.format(labels=labels, text=text)}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
+    }
+    for model in ("gemini-3.6-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"):
+        try:
+            resp = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={key}", json=body, timeout=60,
+            )
+            if resp.status_code != 200:
+                LOGGER.info("Gemini %s 응답 %s", model, resp.status_code)
+                continue
+            data = json.loads(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+        except Exception as exc:
+            LOGGER.info("Gemini %s 실패: %s", model, exc)
+            continue
+        if isinstance(data, dict) and str(data.get("headline") or "").strip():
+            return data
+    return None
+
+
+def process_material(
+    cik: int, acc: str, ticker: str, name: str, updated: str, items: str, dry_run: bool
+) -> str:
+    found = [i.strip() for i in items.split(",") if i.strip() in ITEM_LABELS]
+    if not found:
+        LOGGER.info("%s %s: 추적 항목 아님 — 무시 (items=%s)", ticker, acc, items)
+        return "skip"
+    labels = " · ".join(f"{ITEM_LABELS[i]}({i})" for i in found)
+    text, doc_url = filing_text(cik, acc)
+    brief = summarize_event(text, labels) if text else None
+    if brief is not None and not (set(found) & ALWAYS_ITEMS) and brief.get("material") is False:
+        LOGGER.info("%s %s: 중요도 낮음으로 생략 (%s — %s)", ticker, acc, labels, brief.get("why"))
+        return "skip"
+    e = html.escape
+    parts = [f"⚡ <b>8-K 속보 — {e(name)}({ticker})</b>\n", f"🗂 {e(labels)} · 접수 {e(to_kst(updated))}\n\n"]
+    if brief:
+        parts.append(e(str(brief["headline"]).strip()) + "\n")
+        for point in (brief.get("points") or [])[:3]:
+            parts.append(f"• {e(str(point).strip())}\n")
+    else:
+        parts.append("요약 실패 — 원문을 확인하세요.\n")
+    if doc_url:
+        parts.append(f'\n🔗 <a href="{e(doc_url)}">공시 원문(SEC)</a>')
+    send("".join(parts), dry_run)
+    LOGGER.info("8-K 속보 %s: %s %s (%s)", "출력" if dry_run else "발송", ticker, acc, items)
+    return "sent"
+
+
 def process_accession(
     cik: int, acc: str, ticker: str, name: str, updated: str, dry_run: bool
 ) -> str:
@@ -372,8 +481,7 @@ def process_accession(
         LOGGER.info("%s %s: items 색인 대기 — 다음 폴에서 재확인", ticker, acc)
         return "retry"
     if "2.02" not in meta["items"]:
-        LOGGER.info("%s %s: 실적(2.02) 아님 — 무시 (items=%s)", ticker, acc, meta["items"])
-        return "skip"
+        return process_material(cik, acc, ticker, name, updated, meta["items"], dry_run)
     text, doc_url = press_release_text(cik, acc)
     brief = summarize(text) if text else None
     ctx = market_context(ticker, brief)
