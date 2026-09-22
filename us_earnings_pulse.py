@@ -197,7 +197,7 @@ def summarize(text: str) -> dict | None:
         "contents": [{"parts": [{"text": _PROMPT.format(text=text)}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
     }
-    for model in ("gemini-3.6-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"):
+    for model in ("gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"):
         try:
             resp = requests.post(
                 "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -423,7 +423,7 @@ def summarize_event(text: str, labels: str) -> dict | None:
         "contents": [{"parts": [{"text": _EVENT_PROMPT.format(labels=labels, text=text)}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
     }
-    for model in ("gemini-3.6-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"):
+    for model in ("gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"):
         try:
             resp = requests.post(
                 "https://generativelanguage.googleapis.com/v1beta/models/"
