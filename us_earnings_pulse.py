@@ -36,6 +36,7 @@ WATCHLIST_FILE = Path(__file__).resolve().parent / "watchlist.json"
 KST = dt.timezone(dt.timedelta(hours=9))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "75"))  # 서버 상주 시 40초 등으로 단축
 MAX_TEXT_CHARS = 40_000
+MAX_SEEN = 500
 
 
 def state_path() -> Path:
@@ -52,10 +53,22 @@ def load_state() -> dict:
         return {}
 
 
+def normalize_seen(values: list[str]) -> list[str]:
+    """접수번호의 처리 순서를 유지하면서 중복과 오래된 항목을 제거한다."""
+    ordered: list[str] = []
+    known: set[str] = set()
+    for accession in values:
+        if accession in known:
+            continue
+        known.add(accession)
+        ordered.append(accession)
+    return ordered[-MAX_SEEN:]
+
+
 def save_state(state: dict) -> None:
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    state["seen"] = state.get("seen", [])[-500:]
+    state["seen"] = normalize_seen(state.get("seen", []))
     path.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
@@ -496,17 +509,24 @@ def poll_once(state: dict, watch: dict[str, str], cik_map: dict[int, str], dry_r
     if not entries:
         LOGGER.warning("피드 파싱 0건")
         return 0
-    seen = set(state.get("seen", []))
+    seen_order = normalize_seen(state.get("seen", []))
+    seen = set(seen_order)
     first_run = not seen
     sent = 0
+
+    def mark_seen(accession: str) -> None:
+        if accession not in seen:
+            seen.add(accession)
+            seen_order.append(accession)
+
     for entry in entries:
         if entry["acc"] in seen:
             continue
         if entry["cik"] not in cik_map:
-            seen.add(entry["acc"])
+            mark_seen(entry["acc"])
             continue
         if first_run:
-            seen.add(entry["acc"])
+            mark_seen(entry["acc"])
             LOGGER.info("초기 실행 — %s 기준선만 기록", entry["acc"])
             continue
         ticker = cik_map[entry["cik"]]
@@ -515,10 +535,10 @@ def poll_once(state: dict, watch: dict[str, str], cik_map: dict[int, str], dry_r
         )
         if result == "retry":
             continue  # seen 미기록 → 색인 채워지면 다음 폴에서 처리
-        seen.add(entry["acc"])
+        mark_seen(entry["acc"])
         if result == "sent":
             sent += 1
-    state["seen"] = sorted(seen)
+    state["seen"] = normalize_seen(seen_order)
     return sent
 
 
