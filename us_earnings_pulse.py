@@ -37,6 +37,14 @@ KST = dt.timezone(dt.timedelta(hours=9))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "75"))  # 서버 상주 시 40초 등으로 단축
 MAX_TEXT_CHARS = 40_000
 MAX_SEEN = 500
+# 미국 장 마감 직후(KST 05시대) Gemini가 503으로 몰려 요약 없이 나가던 문제(10/28) —
+# 먼저 보내고, 몇 분 간격으로 다시 요약해 같은 메시지를 고쳐 쓴다.
+RETRY_GAP_SECONDS = 240
+RETRY_MAX_TRIES = 8
+RETRY_WINDOW_SECONDS = 60 * 60
+SUMMARY_PENDING = "요약 준비 중 — AI 요약이 일시적으로 실패해 몇 분 안에 이 메시지에 채워 넣습니다. 원문은 아래 링크."
+SUMMARY_FAILED = "요약 실패 — 원문을 확인하세요."
+PENDING: list[dict] = []   # 이번 폴에서 요약 없이 보낸 건 — poll_once가 state["pending"]으로 옮긴다
 
 
 def state_path() -> Path:
@@ -289,7 +297,8 @@ def market_context(ticker: str, brief: dict | None) -> dict:
     return out
 
 
-def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | None, when_kst: str, ctx: dict | None = None) -> str:
+def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | None, when_kst: str, ctx: dict | None = None,
+                  pending: bool = False) -> str:
     e = html.escape
     parts = [f"⚡ <b>실적 속보 — {e(name)}({ticker})</b>\n"]
     if brief:
@@ -331,7 +340,7 @@ def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | Non
         if brief.get("note"):
             parts.append(f"\n❗ {e(brief['note'])}\n")
     else:
-        parts.append(f"🗓 접수 {e(when_kst)}\n\n보도자료 요약 실패 — 원문을 확인하세요.\n")
+        parts.append(f"🗓 접수 {e(when_kst)}\n\n{SUMMARY_PENDING if pending else '보도자료 ' + SUMMARY_FAILED}\n")
     parts.append("\n")
     if doc_url:
         parts.append(f'🔗 <a href="{e(doc_url)}">보도자료(SEC)</a> · ')
@@ -339,19 +348,25 @@ def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | Non
     return "".join(parts)
 
 
-def send(message: str, dry_run: bool) -> None:
-    if dry_run:
-        print("=" * 60)
-        print(message)
-        return
+def _bot() -> tuple[str, str]:
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
     if not token or not chat_id:
         raise SystemExit("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID가 필요합니다.")
+    return token, chat_id
+
+
+def send(message: str, dry_run: bool) -> int | None:
+    """발송한 메시지 번호(나중에 요약을 채워 넣을 때 사용). 드라이런·번호 미확인은 None."""
+    if dry_run:
+        print("=" * 60)
+        print(message)
+        return None
+    token, chat_id = _bot()
     session = requests.Session()
     session.trust_env = False
     # 읽기 타임아웃은 재시도하지 않는다(중복 발송 사고 방지) — 연결 실패만 예외.
-    session.post(
+    resp = session.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         data={
             "chat_id": chat_id,
@@ -360,7 +375,35 @@ def send(message: str, dry_run: bool) -> None:
             "disable_web_page_preview": "true",
         },
         timeout=30,
-    ).raise_for_status()
+    )
+    resp.raise_for_status()
+    try:
+        return int(resp.json()["result"]["message_id"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def edit(message_id: int, message: str, dry_run: bool) -> bool:
+    if dry_run:
+        print("=" * 60 + f"\n(메시지 {message_id} 고쳐 쓰기)\n" + message)
+        return True
+    token, chat_id = _bot()
+    session = requests.Session()
+    session.trust_env = False
+    resp = session.post(
+        f"https://api.telegram.org/bot{token}/editMessageText",
+        data={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        LOGGER.warning("메시지 %s 고쳐 쓰기 실패: %s", message_id, resp.status_code)
+    return resp.ok
 
 
 def to_kst(updated: str) -> str:
@@ -467,19 +510,71 @@ def process_material(
     if brief is not None and not (set(found) & ALWAYS_ITEMS) and brief.get("material") is False:
         LOGGER.info("%s %s: 중요도 낮음으로 생략 (%s — %s)", ticker, acc, labels, brief.get("why"))
         return "skip"
+    when = to_kst(updated)
+    mid = send(build_event_message(name, ticker, labels, when, brief, doc_url, pending=brief is None), dry_run)
+    if brief is None:
+        _queue_retry("8k", mid, cik, acc, ticker, name, when, labels=labels)
+    LOGGER.info("8-K 속보 %s: %s %s (%s)", "출력" if dry_run else "발송", ticker, acc, items)
+    return "sent"
+
+
+def build_event_message(name: str, ticker: str, labels: str, when_kst: str, brief: dict | None,
+                        doc_url: str | None, pending: bool = False) -> str:
     e = html.escape
-    parts = [f"⚡ <b>8-K 속보 — {e(name)}({ticker})</b>\n", f"🗂 {e(labels)} · 접수 {e(to_kst(updated))}\n\n"]
+    parts = [f"⚡ <b>8-K 속보 — {e(name)}({ticker})</b>\n", f"🗂 {e(labels)} · 접수 {e(when_kst)}\n\n"]
     if brief:
         parts.append(e(str(brief["headline"]).strip()) + "\n")
         for point in (brief.get("points") or [])[:3]:
             parts.append(f"• {e(str(point).strip())}\n")
     else:
-        parts.append("요약 실패 — 원문을 확인하세요.\n")
+        parts.append((SUMMARY_PENDING if pending else SUMMARY_FAILED) + "\n")
     if doc_url:
         parts.append(f'\n🔗 <a href="{e(doc_url)}">공시 원문(SEC)</a>')
-    send("".join(parts), dry_run)
-    LOGGER.info("8-K 속보 %s: %s %s (%s)", "출력" if dry_run else "발송", ticker, acc, items)
-    return "sent"
+    return "".join(parts)
+
+
+def _queue_retry(kind: str, message_id: int | None, cik: int, acc: str, ticker: str, name: str,
+                 when: str, labels: str = "") -> None:
+    if message_id is None:
+        return   # 드라이런이거나 메시지 번호를 몰라 고쳐 쓸 수 없음
+    PENDING.append({"kind": kind, "message_id": message_id, "cik": cik, "acc": acc, "ticker": ticker,
+                    "name": name, "when": when, "labels": labels, "tries": 0,
+                    "since": time.time(), "last": time.time()})
+
+
+def retry_pending(state: dict, dry_run: bool, now: float | None = None) -> int:
+    """요약 없이 보낸 속보를 다시 요약해 같은 메시지를 고쳐 쓴다. 고친 건수 반환.
+    시한(1시간)·횟수를 넘기면 '요약 실패'로 확정 표기하고 손을 뗀다."""
+    now = time.time() if now is None else now
+    pending = state.get("pending", []) + PENDING
+    PENDING.clear()
+    keep, fixed = [], 0
+    for p in pending:
+        if now - p["last"] < RETRY_GAP_SECONDS:
+            keep.append(p)
+            continue
+        p["tries"] += 1
+        p["last"] = now
+        if p["kind"] == "8k":
+            text, doc_url = filing_text(p["cik"], p["acc"])
+            brief = summarize_event(text, p["labels"]) if text else None
+            render = lambda b, pend: build_event_message(p["name"], p["ticker"], p["labels"], p["when"], b, doc_url, pending=pend)
+        else:
+            text, doc_url = press_release_text(p["cik"], p["acc"])
+            brief = summarize(text) if text else None
+            ctx = market_context(p["ticker"], brief) if brief else None
+            render = lambda b, pend: build_message(p["name"], p["ticker"], b, doc_url, p["when"], ctx, pending=pend)
+        if brief:
+            edit(p["message_id"], render(brief, False), dry_run)
+            LOGGER.info("요약 채워 넣음: %s %s (%s번째 재시도)", p["ticker"], p["acc"], p["tries"])
+            fixed += 1
+        elif p["tries"] >= RETRY_MAX_TRIES or now - p["since"] >= RETRY_WINDOW_SECONDS:
+            edit(p["message_id"], render(None, False), dry_run)
+            LOGGER.info("요약 재시도 포기: %s %s", p["ticker"], p["acc"])
+        else:
+            keep.append(p)
+    state["pending"] = keep
+    return fixed
 
 
 def process_accession(
@@ -498,13 +593,19 @@ def process_accession(
     text, doc_url = press_release_text(cik, acc)
     brief = summarize(text) if text else None
     ctx = market_context(ticker, brief)
-    message = build_message(name, ticker, brief, doc_url, to_kst(updated), ctx)
-    send(message, dry_run)
+    when = to_kst(updated)
+    mid = send(build_message(name, ticker, brief, doc_url, when, ctx, pending=brief is None), dry_run)
+    if brief is None:
+        _queue_retry("earnings", mid, cik, acc, ticker, name, when)
     LOGGER.info("속보 %s: %s %s", "출력" if dry_run else "발송", ticker, acc)
     return "sent"
 
 
 def poll_once(state: dict, watch: dict[str, str], cik_map: dict[int, str], dry_run: bool) -> int:
+    try:
+        retry_pending(state, dry_run)
+    except Exception as exc:  # noqa: BLE001 — 재시도 실패가 새 속보 감시를 막지 않게
+        LOGGER.warning("요약 재시도 실패: %s", exc)
     entries = fetch_feed_entries()
     if not entries:
         LOGGER.warning("피드 파싱 0건")
@@ -538,6 +639,8 @@ def poll_once(state: dict, watch: dict[str, str], cik_map: dict[int, str], dry_r
         mark_seen(entry["acc"])
         if result == "sent":
             sent += 1
+    state["pending"] = state.get("pending", []) + PENDING   # 루프 마지막 폴에서 보낸 것도 다음 실행이 이어받게
+    PENDING.clear()
     state["seen"] = normalize_seen(seen_order)
     return sent
 

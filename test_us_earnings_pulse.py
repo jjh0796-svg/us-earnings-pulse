@@ -27,5 +27,45 @@ class SeenStateTests(unittest.TestCase):
         self.assertEqual(normalized, ["later", "early", "newest"])
 
 
+class SummaryRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        pulse.PENDING.clear()
+
+    def test_failed_summary_is_sent_then_filled_in(self) -> None:
+        brief = {"revenue": "$3.79B", "revenue_yoy": "+19%", "eps": "$4.20", "eps_basis": "비GAAP",
+                 "eps_gaap": None, "guide_revenue": None, "guide_margin": None, "note": None,
+                 "period_end": None, "fiscal_label": "FY2026 3Q"}
+        with patch.object(pulse, "filing_meta", return_value={"items": "2.02,9.01", "date": "x"}), \
+                patch.object(pulse, "press_release_text", return_value=("press release", "https://sec/x")), \
+                patch.object(pulse, "summarize", side_effect=[None, brief]), \
+                patch.object(pulse, "market_context", return_value={}), \
+                patch.object(pulse, "send", return_value=77) as send, \
+                patch.object(pulse, "edit", return_value=True) as edit:
+            pulse.process_accession(1, "0001-26-1", "NXPI", "NXP", "2026-10-27T20:23:00Z", False)
+            self.assertIn("요약 준비 중", send.call_args[0][0])
+            state: dict = {"pending": list(pulse.PENDING)}
+            pulse.PENDING.clear()
+            # 재시도 간격 전에는 손대지 않는다
+            self.assertEqual(pulse.retry_pending(state, False, now=state["pending"][0]["last"] + 10), 0)
+            fixed = pulse.retry_pending(state, False, now=state["pending"][0]["last"] + pulse.RETRY_GAP_SECONDS)
+        self.assertEqual(fixed, 1)
+        self.assertEqual(state["pending"], [])
+        mid, text = edit.call_args[0][:2]
+        self.assertEqual(mid, 77)
+        self.assertIn("$3.79B", text)
+        self.assertNotIn("요약 준비 중", text)
+
+    def test_gives_up_with_final_failure_text(self) -> None:
+        state = {"pending": [{"kind": "8k", "message_id": 5, "cik": 1, "acc": "a", "ticker": "MRVL",
+                              "name": "마벨", "when": "05:05 KST", "labels": "중요 계약 체결(1.01)",
+                              "tries": pulse.RETRY_MAX_TRIES - 1, "since": 0.0, "last": 0.0}]}
+        with patch.object(pulse, "filing_text", return_value=("doc", "https://sec/y")), \
+                patch.object(pulse, "summarize_event", return_value=None), \
+                patch.object(pulse, "edit", return_value=True) as edit:
+            pulse.retry_pending(state, False, now=pulse.RETRY_GAP_SECONDS + 1.0)
+        self.assertEqual(state["pending"], [])
+        self.assertIn(pulse.SUMMARY_FAILED, edit.call_args[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()
