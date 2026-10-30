@@ -16,7 +16,7 @@ python us_earnings_pulse.py --probe      # CIK 매핑 확인
 python us_earnings_pulse.py --dry-run    # 1회 조회, 발송 없음
 ```
 
-Secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `GEMINI_API_KEY`
+Secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`(비실적 8-K·기본), `EARNINGS_CHAT_ID`(실적 속보 전용 방, 없으면 기본 방), `GEMINI_API_KEY`
 
 주의: SEC 요청에는 연락처 포함 User-Agent 필수. 텔레그램 읽기 타임아웃은
 재시도하지 않는다(중복 발송 방지).

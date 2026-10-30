@@ -67,5 +67,55 @@ class SummaryRetryTests(unittest.TestCase):
         self.assertIn(pulse.SUMMARY_FAILED, edit.call_args[0][1])
 
 
+class RoutingTests(unittest.TestCase):
+    """실적 속보는 EARNINGS_CHAT_ID(반도체방), 비실적 8-K는 TELEGRAM_CHAT_ID(개인방)."""
+
+    def test_earnings_goes_to_earnings_chat_and_8k_stays(self) -> None:
+        env = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "-100personal", "EARNINGS_CHAT_ID": "-100semi"}
+        with patch.dict(pulse.os.environ, env, clear=False):
+            self.assertEqual(pulse._bot("earnings")[1], "-100semi")
+            self.assertEqual(pulse._bot("8k")[1], "-100personal")
+
+    def test_without_earnings_chat_everything_uses_default(self) -> None:
+        env = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "-100personal", "EARNINGS_CHAT_ID": ""}
+        with patch.dict(pulse.os.environ, env, clear=False):
+            self.assertEqual(pulse._bot("earnings")[1], "-100personal")
+            self.assertEqual(pulse._bot("8k")[1], "-100personal")
+
+    def test_material_8k_is_sent_with_8k_kind(self) -> None:
+        brief = {"headline": "대형 계약", "points": ["10억달러"], "material": True, "why": "x"}
+        with patch.object(pulse, "filing_text", return_value=("doc", "https://sec/z")), \
+                patch.object(pulse, "summarize_event", return_value=brief), \
+                patch.object(pulse, "send", return_value=9) as send:
+            pulse.process_material(1, "a", "MRVL", "마벨", "2026-10-27T20:23:00Z", "1.01,9.01", False)
+        self.assertEqual(send.call_args.kwargs.get("kind"), "8k")
+
+    def test_retry_edit_keeps_original_room(self) -> None:
+        state = {"pending": [{"kind": "8k", "message_id": 5, "cik": 1, "acc": "a", "ticker": "MRVL",
+                              "name": "마벨", "when": "05:05 KST", "labels": "중요 계약 체결(1.01)",
+                              "tries": 0, "since": 0.0, "last": 0.0}]}
+        brief = {"headline": "h", "points": [], "material": True, "why": "x"}
+        with patch.object(pulse, "filing_text", return_value=("doc", "https://sec/y")), \
+                patch.object(pulse, "summarize_event", return_value=brief), \
+                patch.object(pulse, "edit", return_value=True) as edit:
+            pulse.retry_pending(state, False, now=pulse.RETRY_GAP_SECONDS + 1.0)
+        self.assertEqual(edit.call_args.kwargs.get("kind"), "8k")
+
+
+class QuoteTests(unittest.TestCase):
+    def test_quotes_rendered_max_two(self) -> None:
+        brief = {"revenue": "$1B", "eps": "$1.00", "eps_basis": "GAAP", "period_end": None,
+                 "quotes": ["수요가 강하다 — CEO", "마진 개선 — CFO", "세 번째"]}
+        text = pulse.build_message("엔비디아", "NVDA", brief, None, "05:05 KST", None)
+        self.assertIn("💬 <b>경영진</b>", text)
+        self.assertIn("수요가 강하다", text)
+        self.assertNotIn("세 번째", text)
+
+    def test_no_quotes_section_when_empty(self) -> None:
+        brief = {"revenue": "$1B", "eps": None, "period_end": None, "quotes": []}
+        text = pulse.build_message("엔비디아", "NVDA", brief, None, "05:05 KST", None)
+        self.assertNotIn("경영진", text)
+
+
 if __name__ == "__main__":
     unittest.main()

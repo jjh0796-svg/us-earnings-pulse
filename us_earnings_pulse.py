@@ -9,6 +9,11 @@ CODEX us_earnings_alert가 담당 — 이 봇은 속보 전용.
     python us_earnings_pulse.py --dry-run          # 1회 조회, 발송 없이 출력
     python us_earnings_pulse.py --loop-minutes 14  # 75초 간격 반복(스케줄용)
     python us_earnings_pulse.py --force-acc 0000723125-26-000013  # 데모 재발송
+
+발송 방(2026-10-30): 실적 속보(8-K 2.02)는 EARNINGS_CHAT_ID(반도체방), 비실적 8-K
+(계약·채무·임원 변동 등)는 TELEGRAM_CHAT_ID(봇 개인 대화방). EARNINGS_CHAT_ID가 없으면
+둘 다 TELEGRAM_CHAT_ID로 간다. CODEX의 13:40 속보판(flash_digest)은 같은 날 폐지 —
+경영진 코멘트는 이 봇의 요약에 흡수.
 """
 
 from __future__ import annotations
@@ -39,9 +44,10 @@ MAX_TEXT_CHARS = 40_000
 MAX_SEEN = 500
 # 미국 장 마감 직후(KST 05시대) Gemini가 503으로 몰려 요약 없이 나가던 문제(10/28) —
 # 먼저 보내고, 몇 분 간격으로 다시 요약해 같은 메시지를 고쳐 쓴다.
-RETRY_GAP_SECONDS = 240
-RETRY_MAX_TRIES = 8
-RETRY_WINDOW_SECONDS = 60 * 60
+# 10/30: 1시간(4분×8회)으로는 인텔처럼 새벽 혼잡을 못 넘겨 포기한 사례 → 10분 간격 3시간.
+RETRY_GAP_SECONDS = 600
+RETRY_MAX_TRIES = 18
+RETRY_WINDOW_SECONDS = 3 * 60 * 60
 SUMMARY_PENDING = "요약 준비 중 — AI 요약이 일시적으로 실패해 몇 분 안에 이 메시지에 채워 넣습니다. 원문은 아래 링크."
 SUMMARY_FAILED = "요약 실패 — 원문을 확인하세요."
 PENDING: list[dict] = []   # 이번 폴에서 요약 없이 보낸 건 — poll_once가 state["pending"]으로 옮긴다
@@ -174,7 +180,8 @@ JSON 스키마:
  "gross_margin": "이번 분기 매출총이익률, 기준 포함, 예: 비GAAP 78.4% (없으면 null)",
  "guide_revenue": "다음 분기 매출 가이던스, 예: $2.2~2.4B (없으면 null)",
  "guide_margin": "다음 분기 마진 가이던스, 기준 포함, 예: 비GAAP 총마진 39.5~41.5% (없으면 null)",
- "note": "그 외 투자자가 알아야 할 특이사항 한 줄 (없으면 null)"
+ "note": "그 외 투자자가 알아야 할 특이사항 한 줄 (없으면 null)",
+ "quotes": ["경영진 발언 직접 인용의 한국어 번역, 발언자 표기 (예: 'AI 수요가 ... — CEO 젠슨 황'). 수요·가이던스·마진처럼 투자 판단에 닿는 문장만, 최대 2개, 없으면 []"]
 }}
 
 보도자료:
@@ -339,6 +346,10 @@ def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | Non
                 parts.append(f"• {label}{e(g)}\n")
         if brief.get("note"):
             parts.append(f"\n❗ {e(brief['note'])}\n")
+        quotes = [str(q).strip() for q in (brief.get("quotes") or []) if str(q).strip()]
+        if quotes:
+            parts.append("\n💬 <b>경영진</b>\n")
+            parts += [f"• {e(q)}\n" for q in quotes[:2]]
     else:
         parts.append(f"🗓 접수 {e(when_kst)}\n\n{SUMMARY_PENDING if pending else '보도자료 ' + SUMMARY_FAILED}\n")
     parts.append("\n")
@@ -348,21 +359,25 @@ def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | Non
     return "".join(parts)
 
 
-def _bot() -> tuple[str, str]:
+def _bot(kind: str = "earnings") -> tuple[str, str]:
+    """kind='earnings'(실적 속보)는 EARNINGS_CHAT_ID 우선, 그 외('8k')는 TELEGRAM_CHAT_ID."""
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    if kind == "earnings":
+        chat_id = (os.environ.get("EARNINGS_CHAT_ID") or "").strip() or chat_id
     if not token or not chat_id:
         raise SystemExit("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID가 필요합니다.")
     return token, chat_id
 
 
-def send(message: str, dry_run: bool) -> int | None:
+def send(message: str, dry_run: bool, kind: str = "earnings") -> int | None:
     """발송한 메시지 번호(나중에 요약을 채워 넣을 때 사용). 드라이런·번호 미확인은 None."""
     if dry_run:
         print("=" * 60)
+        print(f"[{kind} → {'EARNINGS_CHAT_ID' if kind == 'earnings' and os.environ.get('EARNINGS_CHAT_ID') else 'TELEGRAM_CHAT_ID'}]")
         print(message)
         return None
-    token, chat_id = _bot()
+    token, chat_id = _bot(kind)
     session = requests.Session()
     session.trust_env = False
     # 읽기 타임아웃은 재시도하지 않는다(중복 발송 사고 방지) — 연결 실패만 예외.
@@ -383,11 +398,11 @@ def send(message: str, dry_run: bool) -> int | None:
         return None
 
 
-def edit(message_id: int, message: str, dry_run: bool) -> bool:
+def edit(message_id: int, message: str, dry_run: bool, kind: str = "earnings") -> bool:
     if dry_run:
         print("=" * 60 + f"\n(메시지 {message_id} 고쳐 쓰기)\n" + message)
         return True
-    token, chat_id = _bot()
+    token, chat_id = _bot(kind)
     session = requests.Session()
     session.trust_env = False
     resp = session.post(
@@ -511,7 +526,7 @@ def process_material(
         LOGGER.info("%s %s: 중요도 낮음으로 생략 (%s — %s)", ticker, acc, labels, brief.get("why"))
         return "skip"
     when = to_kst(updated)
-    mid = send(build_event_message(name, ticker, labels, when, brief, doc_url, pending=brief is None), dry_run)
+    mid = send(build_event_message(name, ticker, labels, when, brief, doc_url, pending=brief is None), dry_run, kind="8k")
     if brief is None:
         _queue_retry("8k", mid, cik, acc, ticker, name, when, labels=labels)
     LOGGER.info("8-K 속보 %s: %s %s (%s)", "출력" if dry_run else "발송", ticker, acc, items)
@@ -544,7 +559,7 @@ def _queue_retry(kind: str, message_id: int | None, cik: int, acc: str, ticker: 
 
 def retry_pending(state: dict, dry_run: bool, now: float | None = None) -> int:
     """요약 없이 보낸 속보를 다시 요약해 같은 메시지를 고쳐 쓴다. 고친 건수 반환.
-    시한(1시간)·횟수를 넘기면 '요약 실패'로 확정 표기하고 손을 뗀다."""
+    시한(3시간)·횟수를 넘기면 '요약 실패'로 확정 표기하고 손을 뗀다."""
     now = time.time() if now is None else now
     pending = state.get("pending", []) + PENDING
     PENDING.clear()
@@ -565,11 +580,11 @@ def retry_pending(state: dict, dry_run: bool, now: float | None = None) -> int:
             ctx = market_context(p["ticker"], brief) if brief else None
             render = lambda b, pend: build_message(p["name"], p["ticker"], b, doc_url, p["when"], ctx, pending=pend)
         if brief:
-            edit(p["message_id"], render(brief, False), dry_run)
+            edit(p["message_id"], render(brief, False), dry_run, kind=p["kind"])
             LOGGER.info("요약 채워 넣음: %s %s (%s번째 재시도)", p["ticker"], p["acc"], p["tries"])
             fixed += 1
         elif p["tries"] >= RETRY_MAX_TRIES or now - p["since"] >= RETRY_WINDOW_SECONDS:
-            edit(p["message_id"], render(None, False), dry_run)
+            edit(p["message_id"], render(None, False), dry_run, kind=p["kind"])
             LOGGER.info("요약 재시도 포기: %s %s", p["ticker"], p["acc"])
         else:
             keep.append(p)
