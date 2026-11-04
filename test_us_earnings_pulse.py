@@ -119,3 +119,15 @@ class QuoteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_record_earnings_sent_keeps_recent_and_merges():
+    import datetime as dt
+    import us_earnings_pulse as P
+    now = dt.datetime(2026, 11, 5, 6, 10, tzinfo=P.KST)
+    state = {"earnings_sent": {"AMD": "2026-11-04T06:15+09:00", "OLD": "2026-05-01T06:00+09:00"}}
+    P.EARNINGS_SENT.clear()
+    P.EARNINGS_SENT["QCOM"] = "2026-11-05T06:05+09:00"
+    P.record_earnings_sent(state, now)
+    assert state["earnings_sent"] == {"AMD": "2026-11-04T06:15+09:00", "QCOM": "2026-11-05T06:05+09:00"}
+    assert P.EARNINGS_SENT == {}

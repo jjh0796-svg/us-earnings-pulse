@@ -51,6 +51,8 @@ RETRY_WINDOW_SECONDS = 3 * 60 * 60
 SUMMARY_PENDING = "요약 준비 중 — AI 요약이 일시적으로 실패해 몇 분 안에 이 메시지에 채워 넣습니다. 원문은 아래 링크."
 SUMMARY_FAILED = "요약 실패 — 원문을 확인하세요."
 PENDING: list[dict] = []   # 이번 폴에서 요약 없이 보낸 건 — poll_once가 state["pending"]으로 옮긴다
+EARNINGS_SENT: dict[str, str] = {}  # 이번 폴에서 실적 속보를 보낸 종목 → 발송 시각(KST ISO). 브리핑의 "발표 확인"이 읽는다
+EARNINGS_SENT_DAYS = 120
 
 
 def state_path() -> Path:
@@ -612,8 +614,21 @@ def process_accession(
     mid = send(build_message(name, ticker, brief, doc_url, when, ctx, pending=brief is None), dry_run)
     if brief is None:
         _queue_retry("earnings", mid, cik, acc, ticker, name, when)
+    if not dry_run:
+        EARNINGS_SENT[ticker] = dt.datetime.now(KST).isoformat(timespec="minutes")
     LOGGER.info("속보 %s: %s %s", "출력" if dry_run else "발송", ticker, acc)
     return "sent"
+
+
+def record_earnings_sent(state: dict, now: dt.datetime | None = None) -> None:
+    """실적(2.02) 속보를 보낸 종목·시각을 state["earnings_sent"]에 남긴다(120일 보관).
+    CODEX decision_digest가 이걸 읽어 '발표 확인'을 야후 갱신(반나절~하루 지연)보다 먼저 판정한다."""
+    now = now or dt.datetime.now(KST)
+    record = dict(state.get("earnings_sent") or {})
+    record.update(EARNINGS_SENT)
+    EARNINGS_SENT.clear()
+    cutoff = (now - dt.timedelta(days=EARNINGS_SENT_DAYS)).isoformat()
+    state["earnings_sent"] = {t: at for t, at in record.items() if at >= cutoff}
 
 
 def poll_once(state: dict, watch: dict[str, str], cik_map: dict[int, str], dry_run: bool) -> int:
@@ -656,6 +671,7 @@ def poll_once(state: dict, watch: dict[str, str], cik_map: dict[int, str], dry_r
             sent += 1
     state["pending"] = state.get("pending", []) + PENDING   # 루프 마지막 폴에서 보낸 것도 다음 실행이 이어받게
     PENDING.clear()
+    record_earnings_sent(state)
     state["seen"] = normalize_seen(seen_order)
     return sent
 
