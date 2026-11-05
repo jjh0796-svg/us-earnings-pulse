@@ -474,21 +474,41 @@ def send(message: str, dry_run: bool, kind: str = "earnings", room: str = "") ->
     session = requests.Session()
     session.trust_env = False
     # 읽기 타임아웃은 재시도하지 않는다(중복 발송 사고 방지) — 연결 실패만 예외.
-    resp = session.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data={
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
     try:
-        return int(resp.json()["result"]["message_id"])
+        resp = session.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "true",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        # 11/5: '발송 실패' 문구가 있어야 봇운영실이 즉시 경고로 잡는다(조용히 묻히던 문제)
+        LOGGER.error("발송 실패(%s%s): %s", kind, " 바이오방" if room == "bio" else "", exc)
+        raise
+    try:
+        message_id = int(resp.json()["result"]["message_id"])
     except (ValueError, KeyError, TypeError):
         return None
+    _ops_record(chat_id, message_id, message, token)
+    return message_id
+
+
+def _ops_record(chat_id: str, message_id: int, text: str, token: str) -> None:
+    """봇운영실 도착 요약(CODEX tools.monitor_store)에 발송 기록 — 11/5부터 실적속보도 집계. 실패는 무해."""
+    try:
+        import sys
+        codex = os.environ.get("CODEX_DIR", "/home/ubuntu/codex")
+        if codex not in sys.path:
+            sys.path.insert(0, codex)
+        from tools.monitor_store import record_message
+        record_message(chat_id, message_id, text, bot=str(token).split(":")[0], job="us_pulse")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def edit(message_id: int, message: str, dry_run: bool, kind: str = "earnings", room: str = "") -> bool:
