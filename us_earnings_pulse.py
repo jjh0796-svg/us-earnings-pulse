@@ -94,21 +94,42 @@ def _get(url: str) -> requests.Response:
     return resp
 
 
+BIO_WATCHLIST_FILE = Path(__file__).resolve().parent / "watchlist_bio.json"
+# 바이오방 발송(11/5): 바이오 종목의 실적·중요 8-K는 바이오 봇으로 바이오방에. 토큰은 서버의 바이오 봇
+# 설정 파일을 읽기만 한다(이 봇 env에 새 비밀값을 쓰지 않음).
+BIO_ENV_FILE = os.environ.get("BIO_ENV_FILE") or "/home/ubuntu/bots/env.d/bio.env"
+BIO_TICKERS: set[str] = set()
+
+
 def load_watchlist() -> dict[str, str]:
-    return json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
+    watch = json.loads(WATCHLIST_FILE.read_text(encoding="utf-8"))
+    try:
+        bio = {k: v for k, v in json.loads(BIO_WATCHLIST_FILE.read_text(encoding="utf-8")).items()
+               if not k.startswith("_")}
+    except (OSError, ValueError):
+        bio = {}
+    BIO_TICKERS.clear()
+    BIO_TICKERS.update(t for t in bio if t not in watch)   # 반도체 목록과 겹치면 기존 방 유지
+    return {**bio, **watch}
+
+
+def room_for(ticker: str) -> str:
+    return "bio" if ticker in BIO_TICKERS else ""
 
 
 def cik_for_watch(state: dict, watch: dict[str, str]) -> dict[int, str]:
     """{cik: ticker} — 하루 한 번만 SEC 티커맵을 갱신."""
     today = dt.date.today().isoformat()
     cached = state.get("cik_map") or {}
-    if state.get("cik_map_date") == today and cached:
+    signature = ",".join(sorted(watch))   # 워치 목록이 바뀌면(11/5 바이오 추가) 당일이라도 다시 받는다
+    if state.get("cik_map_date") == today and cached and state.get("cik_map_watch") == signature:
         return {int(k): v for k, v in cached.items()}
     data = _get("https://www.sec.gov/files/company_tickers.json").json()
     by_ticker = {v["ticker"].upper(): int(v["cik_str"]) for v in data.values()}
     result = {by_ticker[t]: t for t in watch if t in by_ticker}
     state["cik_map"] = {str(k): v for k, v in result.items()}
     state["cik_map_date"] = today
+    state["cik_map_watch"] = signature
     return result
 
 
@@ -190,6 +211,18 @@ JSON 스키마:
 {text}
 """
 
+# 바이오 실적(11/5): 임상 단계 회사는 매출이 작거나 없다 — 현금·소진 시점·파이프라인 일정이 핵심
+_BIO_PROMPT = _PROMPT.replace(
+    ' "quotes": [',
+    ' "cash": "분기말 현금·현금성자산·투자자산 합계, 예: $1.2B (없으면 null)",\n'
+    ' "runway": "회사가 밝힌 현금 소진 예상 시점, 예: 2028년까지 (없으면 null)",\n'
+    ' "net_loss": "순손실(또는 순이익), 예: 순손실 $85M (없으면 null)",\n'
+    ' "pipeline": ["이번 분기 성과·향후 일정 중 주가에 닿는 것(임상 결과·허가 신청·승인·출시·학회 발표 일정)을 '
+    '한 줄씩, 약물명(기전)·적응증·시점 포함, 최대 3개, 없으면 []"],\n'
+    ' "quotes": [').replace("revenue\": \"매출, 예: $2.05B\"",
+                           "revenue\": \"총매출(제품+협력 수익), 예: $342M (매출이 없으면 null)\"")
+
+
 _MONTH_NAMES = {
     1: "january", 2: "february", 3: "march", 4: "april", 5: "may", 6: "june",
     7: "july", 8: "august", 9: "september", 10: "october", 11: "november", 12: "december",
@@ -219,12 +252,12 @@ def _calendar_label(period_end: str | None) -> str | None:
     return f"달력 {(mid.month - 1) // 3 + 1}Q{mid.year % 100} ({m}/{d} 마감)"
 
 
-def summarize(text: str) -> dict | None:
+def summarize(text: str, bio: bool = False) -> dict | None:
     key = (os.environ.get("GEMINI_API_KEY") or "").strip()
     if not key:
         return None
     body = {
-        "contents": [{"parts": [{"text": _PROMPT.format(text=text)}]}],
+        "contents": [{"parts": [{"text": (_BIO_PROMPT if bio else _PROMPT).format(text=text)}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
     }
     for model in ("gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"):
@@ -242,10 +275,14 @@ def summarize(text: str) -> dict | None:
         except Exception as exc:
             LOGGER.info("Gemini %s 실패: %s", model, exc)
             continue
-        if isinstance(data, dict) and str(data.get("revenue") or "").strip():
+        has_core = isinstance(data, dict) and (
+            str(data.get("revenue") or "").strip()
+            or (bio and (data.get("pipeline") or str(data.get("cash") or "").strip())))
+        if has_core:
             for field in (
                 "period_end", "fiscal_label", "revenue", "revenue_yoy", "eps",
                 "eps_basis", "eps_gaap", "guide_revenue", "guide_margin", "note",
+                "cash", "runway", "net_loss",
             ):
                 value = data.get(field)
                 data[field] = str(value).strip() if value not in (None, "") else None
@@ -269,7 +306,7 @@ def _num_from_money(text) -> float | None:
     return v
 
 
-def market_context(ticker: str, brief: dict | None) -> dict:
+def market_context(ticker: str, brief: dict | None, revenue_consensus: bool = False) -> dict:
     """야후에서 컨센서스·주가 반응을 보강 (실패는 조용히 생략).
 
     주의: 발표 직후 야후 0q 예상치가 다음 분기로 롤오버됐을 수 있어,
@@ -301,27 +338,55 @@ def market_context(ticker: str, brief: dict | None) -> dict:
                 out["eps_surprise"] = float(last["surprisePercent"]) * 100
         except Exception:
             pass
+        if revenue_consensus:
+            # 매출 컨센서스(바이오, 11/5): 야후 0q 평균 예상치. 발표 직후 몇 분 안이라 대개 이번 분기지만,
+            # 다음 분기로 넘어갔을 수 있어 실제치와 ±40% 넘게 어긋나면 버린다(EPS 오염 사고와 같은 안전장치).
+            try:
+                actual_rev = _num_from_money((brief or {}).get("revenue"))
+                est_rev = float(t.revenue_estimate.loc["0q", "avg"])
+                if actual_rev and est_rev > 0 and 0.6 <= actual_rev / est_rev <= 1.4:
+                    out["rev_est"] = est_rev
+                    out["rev_surprise"] = (actual_rev / est_rev - 1) * 100
+            except Exception:
+                pass
     except Exception as exc:
         LOGGER.info("시장 컨텍스트 실패(%s): %s", ticker, exc)
     return out
 
 
+def _money_short(v: float) -> str:
+    return f"${v / 1e9:.2f}B" if v >= 1e9 else f"${v / 1e6:,.1f}M"
+
+
 def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | None, when_kst: str, ctx: dict | None = None,
-                  pending: bool = False) -> str:
+                  pending: bool = False, bio: bool = False) -> str:
     e = html.escape
-    parts = [f"⚡ <b>실적 속보 — {e(name)}({ticker})</b>\n"]
+    head = "📊 <b>바이오 실적 속보" if bio else "⚡ <b>실적 속보"
+    parts = [f"{head} — {e(name)}({ticker})</b>\n"]
     if brief:
         # 분기 표기: 회계 분기명 + 달력 분기 병기 (혼동 방지)
         cal = _calendar_label(brief.get("period_end"))
         quarter_bits = [b for b in (brief.get("fiscal_label"), cal) if b]
         quarter_line = " = ".join(quarter_bits)
         parts.append(f"🗓 {e(quarter_line)} · 접수 {e(when_kst)}\n\n" if quarter_line else f"🗓 접수 {e(when_kst)}\n\n")
-        rev = f"📈 매출 {e(brief['revenue'])}"
-        if brief.get("revenue_yoy"):
-            rev += f" (YoY {e(brief['revenue_yoy'])})"
-        if ctx and ctx.get("rev_surprise") is not None:
-            rev += f" · 예상比 {ctx['rev_surprise']:+.1f}%"
-        parts.append(rev + "\n")
+        if brief.get("revenue"):
+            rev = f"📈 매출 {e(brief['revenue'])}"
+            if brief.get("revenue_yoy"):
+                rev += f" (YoY {e(brief['revenue_yoy'])})"
+            if ctx and ctx.get("rev_surprise") is not None:
+                if bio and ctx.get("rev_est"):
+                    word = "상회" if ctx["rev_surprise"] >= 0 else "하회"
+                    rev += (f"\n   컨센서스 {_money_short(ctx['rev_est'])}를 {abs(ctx['rev_surprise']):.1f}% {word}"
+                            " (야후 기준)")
+                else:
+                    rev += f" · 예상比 {ctx['rev_surprise']:+.1f}%"
+            parts.append(rev + "\n")
+        if bio:
+            money = [x for x in (brief.get("net_loss"),
+                                 f"현금 {brief['cash']}" if brief.get("cash") else None,
+                                 f"소진 예상 {brief['runway']}" if brief.get("runway") else None) if x]
+            if money:
+                parts.append(f"🏦 {e(' · '.join(money))}\n")
         if brief.get("eps"):
             eps = f"💰 EPS {e(brief['eps'])}"
             if brief.get("eps_basis"):
@@ -346,6 +411,10 @@ def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | Non
             labels = ["매출 ", ""] if brief.get("guide_revenue") else [""]
             for label, g in zip(labels, guides):
                 parts.append(f"• {label}{e(g)}\n")
+        pipeline = [str(p).strip() for p in (brief.get("pipeline") or []) if str(p).strip()] if bio else []
+        if pipeline:
+            parts.append("\n🧬 <b>파이프라인·일정</b>\n")
+            parts += [f"• {e(p)}\n" for p in pipeline[:3]]
         if brief.get("note"):
             parts.append(f"\n❗ {e(brief['note'])}\n")
         quotes = [str(q).strip() for q in (brief.get("quotes") or []) if str(q).strip()]
@@ -356,13 +425,33 @@ def build_message(name: str, ticker: str, brief: dict | None, doc_url: str | Non
         parts.append(f"🗓 접수 {e(when_kst)}\n\n{SUMMARY_PENDING if pending else '보도자료 ' + SUMMARY_FAILED}\n")
     parts.append("\n")
     if doc_url:
-        parts.append(f'🔗 <a href="{e(doc_url)}">보도자료(SEC)</a> · ')
-    parts.append("상세 분석·차트는 내일 아침 자동 발송")
+        parts.append(f'🔗 <a href="{e(doc_url)}">보도자료(SEC)</a>' + ("" if bio else " · "))
+    if not bio:   # 차트 분석(CODEX us_earnings_alert)은 반도체 워치 종목만
+        parts.append("상세 분석·차트는 내일 아침 자동 발송")
     return "".join(parts)
 
 
-def _bot(kind: str = "earnings") -> tuple[str, str]:
-    """kind='earnings'(실적 속보)는 EARNINGS_CHAT_ID 우선, 그 외('8k')는 TELEGRAM_CHAT_ID."""
+def _read_env_file(path: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, v = line.split("=", 1)
+            values[k.strip().removeprefix("export ")] = v.strip().strip("\"'")
+    return values
+
+
+def _bot(kind: str = "earnings", room: str = "") -> tuple[str, str]:
+    """kind='earnings'(실적 속보)는 EARNINGS_CHAT_ID 우선, 그 외('8k')는 TELEGRAM_CHAT_ID.
+    room='bio'면 실적·8-K 모두 바이오 봇 설정 파일의 토큰·방(다른 방으로 새지 않게 폴백 없음)."""
+    if room == "bio":
+        try:
+            values = _read_env_file(BIO_ENV_FILE)
+        except OSError as exc:
+            raise RuntimeError(f"바이오 봇 설정 파일 없음 — 발송 실패: {exc}") from exc
+        token, chat_id = values.get("TELEGRAM_BOT_TOKEN", ""), values.get("TELEGRAM_CHAT_ID", "")
+        if not token or not chat_id:
+            raise RuntimeError("바이오 봇 토큰/방 정보 없음 — 발송 실패")
+        return token, chat_id
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
     if kind == "earnings":
@@ -372,14 +461,16 @@ def _bot(kind: str = "earnings") -> tuple[str, str]:
     return token, chat_id
 
 
-def send(message: str, dry_run: bool, kind: str = "earnings") -> int | None:
+def send(message: str, dry_run: bool, kind: str = "earnings", room: str = "") -> int | None:
     """발송한 메시지 번호(나중에 요약을 채워 넣을 때 사용). 드라이런·번호 미확인은 None."""
     if dry_run:
         print("=" * 60)
-        print(f"[{kind} → {'EARNINGS_CHAT_ID' if kind == 'earnings' and os.environ.get('EARNINGS_CHAT_ID') else 'TELEGRAM_CHAT_ID'}]")
+        target = "바이오방" if room == "bio" else (
+            "EARNINGS_CHAT_ID" if kind == "earnings" and os.environ.get("EARNINGS_CHAT_ID") else "TELEGRAM_CHAT_ID")
+        print(f"[{kind} → {target}]")
         print(message)
         return None
-    token, chat_id = _bot(kind)
+    token, chat_id = _bot(kind, room)
     session = requests.Session()
     session.trust_env = False
     # 읽기 타임아웃은 재시도하지 않는다(중복 발송 사고 방지) — 연결 실패만 예외.
@@ -400,11 +491,11 @@ def send(message: str, dry_run: bool, kind: str = "earnings") -> int | None:
         return None
 
 
-def edit(message_id: int, message: str, dry_run: bool, kind: str = "earnings") -> bool:
+def edit(message_id: int, message: str, dry_run: bool, kind: str = "earnings", room: str = "") -> bool:
     if dry_run:
         print("=" * 60 + f"\n(메시지 {message_id} 고쳐 쓰기)\n" + message)
         return True
-    token, chat_id = _bot(kind)
+    token, chat_id = _bot(kind, room)
     session = requests.Session()
     session.trust_env = False
     resp = session.post(
@@ -528,9 +619,11 @@ def process_material(
         LOGGER.info("%s %s: 중요도 낮음으로 생략 (%s — %s)", ticker, acc, labels, brief.get("why"))
         return "skip"
     when = to_kst(updated)
-    mid = send(build_event_message(name, ticker, labels, when, brief, doc_url, pending=brief is None), dry_run, kind="8k")
+    room = room_for(ticker)   # 바이오 종목의 계약(1.01)·인수(2.01) 등은 바이오방으로
+    mid = send(build_event_message(name, ticker, labels, when, brief, doc_url, pending=brief is None), dry_run,
+               kind="8k", room=room)
     if brief is None:
-        _queue_retry("8k", mid, cik, acc, ticker, name, when, labels=labels)
+        _queue_retry("8k", mid, cik, acc, ticker, name, when, labels=labels, room=room)
     LOGGER.info("8-K 속보 %s: %s %s (%s)", "출력" if dry_run else "발송", ticker, acc, items)
     return "sent"
 
@@ -551,11 +644,11 @@ def build_event_message(name: str, ticker: str, labels: str, when_kst: str, brie
 
 
 def _queue_retry(kind: str, message_id: int | None, cik: int, acc: str, ticker: str, name: str,
-                 when: str, labels: str = "") -> None:
+                 when: str, labels: str = "", room: str = "") -> None:
     if message_id is None:
         return   # 드라이런이거나 메시지 번호를 몰라 고쳐 쓸 수 없음
     PENDING.append({"kind": kind, "message_id": message_id, "cik": cik, "acc": acc, "ticker": ticker,
-                    "name": name, "when": when, "labels": labels, "tries": 0,
+                    "name": name, "when": when, "labels": labels, "room": room, "tries": 0,
                     "since": time.time(), "last": time.time()})
 
 
@@ -577,16 +670,18 @@ def retry_pending(state: dict, dry_run: bool, now: float | None = None) -> int:
             brief = summarize_event(text, p["labels"]) if text else None
             render = lambda b, pend: build_event_message(p["name"], p["ticker"], p["labels"], p["when"], b, doc_url, pending=pend)
         else:
+            bio = p.get("room") == "bio"
             text, doc_url = press_release_text(p["cik"], p["acc"])
-            brief = summarize(text) if text else None
-            ctx = market_context(p["ticker"], brief) if brief else None
-            render = lambda b, pend: build_message(p["name"], p["ticker"], b, doc_url, p["when"], ctx, pending=pend)
+            brief = summarize(text, bio=bio) if text else None
+            ctx = market_context(p["ticker"], brief, revenue_consensus=bio) if brief else None
+            render = lambda b, pend: build_message(p["name"], p["ticker"], b, doc_url, p["when"], ctx, pending=pend,
+                                                   bio=bio)
         if brief:
-            edit(p["message_id"], render(brief, False), dry_run, kind=p["kind"])
+            edit(p["message_id"], render(brief, False), dry_run, kind=p["kind"], room=p.get("room", ""))
             LOGGER.info("요약 채워 넣음: %s %s (%s번째 재시도)", p["ticker"], p["acc"], p["tries"])
             fixed += 1
         elif p["tries"] >= RETRY_MAX_TRIES or now - p["since"] >= RETRY_WINDOW_SECONDS:
-            edit(p["message_id"], render(None, False), dry_run, kind=p["kind"])
+            edit(p["message_id"], render(None, False), dry_run, kind=p["kind"], room=p.get("room", ""))
             LOGGER.info("요약 재시도 포기: %s %s", p["ticker"], p["acc"])
         else:
             keep.append(p)
@@ -607,13 +702,16 @@ def process_accession(
         return "retry"
     if "2.02" not in meta["items"]:
         return process_material(cik, acc, ticker, name, updated, meta["items"], dry_run)
+    room = room_for(ticker)
+    bio = room == "bio"
     text, doc_url = press_release_text(cik, acc)
-    brief = summarize(text) if text else None
-    ctx = market_context(ticker, brief)
+    brief = summarize(text, bio=bio) if text else None
+    ctx = market_context(ticker, brief, revenue_consensus=bio)
     when = to_kst(updated)
-    mid = send(build_message(name, ticker, brief, doc_url, when, ctx, pending=brief is None), dry_run)
+    mid = send(build_message(name, ticker, brief, doc_url, when, ctx, pending=brief is None, bio=bio),
+               dry_run, room=room)
     if brief is None:
-        _queue_retry("earnings", mid, cik, acc, ticker, name, when)
+        _queue_retry("earnings", mid, cik, acc, ticker, name, when, room=room)
     if not dry_run:
         EARNINGS_SENT[ticker] = dt.datetime.now(KST).isoformat(timespec="minutes")
     LOGGER.info("속보 %s: %s %s", "출력" if dry_run else "발송", ticker, acc)

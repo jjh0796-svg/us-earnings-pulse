@@ -131,3 +131,40 @@ def test_record_earnings_sent_keeps_recent_and_merges():
     P.record_earnings_sent(state, now)
     assert state["earnings_sent"] == {"AMD": "2026-11-04T06:15+09:00", "QCOM": "2026-11-05T06:05+09:00"}
     assert P.EARNINGS_SENT == {}
+
+
+def test_bio_watchlist_routes_to_bio_room_and_keeps_semis():
+    import us_earnings_pulse as P
+    watch = P.load_watchlist()
+    assert "NVDA" in watch and "ACAD" in watch
+    assert P.room_for("ACAD") == "bio" and P.room_for("NVDA") == ""
+    assert not any(t.startswith("_") for t in watch)
+
+
+def test_bio_room_token_comes_from_bio_env_file(tmp_path, monkeypatch):
+    import us_earnings_pulse as P
+    env = tmp_path / "bio.env"
+    env.write_text('TELEGRAM_BOT_TOKEN="111:abc"\nTELEGRAM_CHAT_ID=-100123\n', encoding="utf-8")
+    monkeypatch.setattr(P, "BIO_ENV_FILE", str(env))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "999:semi")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100999")
+    assert P._bot("earnings", "bio") == ("111:abc", "-100123")
+    assert P._bot("earnings", "")[0] == "999:semi"
+    monkeypatch.setattr(P, "BIO_ENV_FILE", str(tmp_path / "missing.env"))
+    try:
+        P._bot("earnings", "bio")
+        raise AssertionError("설정 파일이 없으면 다른 방으로 새지 말고 실패해야 한다")
+    except RuntimeError:
+        pass
+
+
+def test_bio_message_shows_consensus_cash_and_pipeline():
+    import us_earnings_pulse as P
+    brief = {"revenue": "$342M", "revenue_yoy": "+12%", "eps": None, "cash": "$1.2B", "runway": "2028년까지",
+             "net_loss": "순손실 $20M", "pipeline": ["DAYBUE STIX 처방 확대", "ACP-204 2상 결과 2027년 상반기"]}
+    msg = P.build_message("아카디아", "ACAD", brief, "https://sec.gov/x", "11/05 06:21",
+                          {"rev_est": 332.6e6, "rev_surprise": 2.83}, bio=True)
+    assert "바이오 실적 속보" in msg and "컨센서스 $332.6M를 2.8% 상회" in msg
+    assert "현금 $1.2B" in msg and "파이프라인" in msg and "ACP-204" in msg
+    assert "내일 아침" not in msg
+    assert '"pipeline"' in P._BIO_PROMPT and '"cash"' in P._BIO_PROMPT and "{text}" in P._BIO_PROMPT
